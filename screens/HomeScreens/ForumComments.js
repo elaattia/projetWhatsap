@@ -1,9 +1,10 @@
-// screens/HomeScreens/ForumComments.js
+// screens/HomeScreens/ForumComments.js (avec AsyncStorage)
 import React, { useEffect, useState, useRef } from 'react';
-import { View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, Image, KeyboardAvoidingView, Platform,ActivityIndicator,Alert} from 'react-native';
+import { View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, Image, KeyboardAvoidingView, Platform, ActivityIndicator, Alert } from 'react-native';
 import { supabase } from '../../config/supabaseClient';
 import { auth } from '../../config/firebaseConfig';
 import { Ionicons } from '@expo/vector-icons';
+import CacheService from '../../services/cacheService';
 
 export default function ForumComments({ route, navigation }) {
   const { post } = route.params;
@@ -16,10 +17,26 @@ export default function ForumComments({ route, navigation }) {
   const [commentsCount, setCommentsCount] = useState(post.comments_count || 0);
 
   const flatRef = useRef();
+  const cacheKey = `comments_${post.id}`;
 
-  const loadComments = async () => {
+  const loadComments = async (forceRefresh = false) => {
     try {
-      setLoading(true);
+      if (!forceRefresh) {
+        setLoading(true);
+        
+        // 1. Charger depuis le cache d'abord
+        const cachedData = await CacheService.getCachedMessages(cacheKey);
+        
+        if (cachedData) {
+          console.log(' Commentaires chargés depuis le cache');
+          setComments(cachedData);
+          setCommentsCount(cachedData.length);
+          setLoading(false);
+          setTimeout(() => flatRef.current?.scrollToEnd?.({ animated: false }), 100);
+        }
+      }
+
+      // 2. Charger depuis Supabase (en arrière-plan si cache disponible)
       const { data, error } = await supabase
         .from('forum_comments')
         .select(`
@@ -30,11 +47,14 @@ export default function ForumComments({ route, navigation }) {
         .order('created_at', { ascending: true });
 
       if (error) throw error;
+
+      // 3. Mettre à jour le cache et l'interface
+      await CacheService.cacheMessages(cacheKey, data || []);
       setComments(data || []);
-      
       setCommentsCount(data?.length || 0);
       
       setTimeout(() => flatRef.current?.scrollToEnd?.({ animated: true }), 200);
+      
     } catch (e) {
       console.log('loadComments error', e);
     } finally {
@@ -67,8 +87,13 @@ export default function ForumComments({ route, navigation }) {
             users: userData
           };
           
-          setComments((prev) => [...prev, newComment]);
+          const updatedComments = [...comments, newComment];
+          setComments(updatedComments);
           setCommentsCount(prev => prev + 1);
+          
+          // Mettre à jour le cache
+          await CacheService.cacheMessages(cacheKey, updatedComments);
+          
           setTimeout(() => flatRef.current?.scrollToEnd({ animated: true }), 100);
         }
       )
@@ -80,9 +105,13 @@ export default function ForumComments({ route, navigation }) {
           table: 'forum_comments',
           filter: `post_id=eq.${post.id}`
         },
-        (payload) => {
-          setComments((prev) => prev.filter(c => c.id !== payload.old.id));
+        async (payload) => {
+          const updatedComments = comments.filter(c => c.id !== payload.old.id);
+          setComments(updatedComments);
           setCommentsCount(prev => Math.max(0, prev - 1));
+          
+          // Mettre à jour le cache
+          await CacheService.cacheMessages(cacheKey, updatedComments);
         }
       )
       .subscribe();
@@ -95,6 +124,29 @@ export default function ForumComments({ route, navigation }) {
 
     const text = commentText.trim();
     setCommentText('');
+
+    // Créer un commentaire optimiste
+    const optimisticComment = {
+      id: `temp_${Date.now()}`,
+      post_id: post.id,
+      user_id: currentUser.uid,
+      content: text,
+      created_at: new Date().toISOString(),
+      users: {
+        name: auth.currentUser.displayName,
+        avatar: null,
+        email: auth.currentUser.email
+      }
+    };
+
+    const updatedComments = [...comments, optimisticComment];
+    setComments(updatedComments);
+    setCommentsCount(prev => prev + 1);
+    
+    // Mettre à jour le cache immédiatement
+    await CacheService.cacheMessages(cacheKey, updatedComments);
+    
+    setTimeout(() => flatRef.current?.scrollToEnd({ animated: true }), 100);
 
     try {
       setSending(true);
@@ -109,7 +161,7 @@ export default function ForumComments({ route, navigation }) {
 
       if (error) throw error;
 
-      const newCount = commentsCount + 1;
+      const newCount = commentsCount;
       await supabase
         .from('forum_posts')
         .update({ comments_count: newCount })
@@ -118,6 +170,13 @@ export default function ForumComments({ route, navigation }) {
     } catch (e) {
       console.log('sendComment error', e);
       Alert.alert('Erreur', 'Impossible d\'envoyer le commentaire');
+      
+      // Revenir en arrière
+      const revertedComments = comments.filter(c => c.id !== optimisticComment.id);
+      setComments(revertedComments);
+      setCommentsCount(prev => Math.max(0, prev - 1));
+      await CacheService.cacheMessages(cacheKey, revertedComments);
+      
       setCommentText(text);
     } finally {
       setSending(false);
@@ -140,20 +199,13 @@ export default function ForumComments({ route, navigation }) {
           style: 'destructive',
           onPress: async () => {
             try {
-              console.log('Deleting comment:', comment.id);
-              
               const { error } = await supabase
                 .from('forum_comments')
                 .delete()
                 .eq('id', comment.id)
                 .eq('user_id', currentUser.uid);
 
-              if (error) {
-                console.log('Delete comment error:', error);
-                throw error;
-              }
-
-              console.log('Comment deleted successfully');
+              if (error) throw error;
 
               const newCount = Math.max(0, commentsCount - 1);
               const { error: updateError } = await supabase
@@ -167,7 +219,8 @@ export default function ForumComments({ route, navigation }) {
 
               Alert.alert('Succès', 'Commentaire supprimé');
               
-              await loadComments();
+              // Recharger et mettre à jour le cache
+              await loadComments(true);
               
             } catch (e) {
               console.log('deleteComment error', e);
@@ -192,6 +245,7 @@ export default function ForumComments({ route, navigation }) {
 
   const renderComment = ({ item }) => {
     const isMyComment = item.user_id === currentUser.uid;
+    const isOptimistic = item.id?.toString().startsWith('temp_');
 
     return (
       <View style={styles.commentCard}>
@@ -208,11 +262,14 @@ export default function ForumComments({ route, navigation }) {
             <View style={styles.commentMeta}>
               <Text style={styles.userName}>{item.users?.name || item.users?.email}</Text>
               <Text style={styles.commentTime}>{getTimeAgo(item.created_at)}</Text>
+              {isOptimistic && (
+                <Ionicons name="time-outline" size={12} color="#999" style={{ marginLeft: 4 }} />
+              )}
             </View>
             <Text style={styles.commentText}>{item.content}</Text>
           </View>
 
-          {isMyComment && (
+          {isMyComment && !isOptimistic && (
             <TouchableOpacity onPress={() => deleteComment(item)} style={styles.deleteBtn}>
               <Ionicons name="trash-outline" size={18} color="#f44336" />
             </TouchableOpacity>
@@ -247,13 +304,13 @@ export default function ForumComments({ route, navigation }) {
       </View>
 
       <View style={styles.container}>
-        {loading ? (
+        {loading && !comments.length ? (
           <ActivityIndicator style={{ marginTop: 20 }} color="#25D366" />
         ) : (
           <FlatList
             ref={flatRef}
             data={comments}
-            keyExtractor={(item) => item.id}
+            keyExtractor={(item) => item.id?.toString() || item.created_at}
             renderItem={renderComment}
             contentContainerStyle={{ padding: 12, paddingBottom: 80 }}
             ListEmptyComponent={

@@ -1,12 +1,66 @@
-// screens/HomeScreens/ChatScreen.js
+// screens/HomeScreens/ChatScreen.js (CORRIGÉ)
 import React, { useEffect, useState, useRef } from 'react';
-import { View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, Image, ImageBackground,KeyboardAvoidingView, Platform, ActivityIndicator } from 'react-native';
+import { View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, Image, ImageBackground, KeyboardAvoidingView, Platform, ActivityIndicator, Animated } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import { supabase } from '../../config/supabaseClient';
 import { auth } from '../../config/firebaseConfig';
 import { Ionicons } from '@expo/vector-icons';
 import { sendPushNotification } from '../../services/notificationService';
 import { resetUserActivity } from '../../utils/activityTracker';
+import CacheService from '../../services/cacheService';
+
+const TypingIndicator = () => {
+  const dot1 = useRef(new Animated.Value(0)).current;
+  const dot2 = useRef(new Animated.Value(0)).current;
+  const dot3 = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    const animateDot = (dot, delay) => {
+      Animated.loop(
+        Animated.sequence([
+          Animated.delay(delay),
+          Animated.timing(dot, {
+            toValue: 1,
+            duration: 400,
+            useNativeDriver: true,
+          }),
+          Animated.timing(dot, {
+            toValue: 0,
+            duration: 400,
+            useNativeDriver: true,
+          }),
+        ])
+      ).start();
+    };
+
+    animateDot(dot1, 0);
+    animateDot(dot2, 200);
+    animateDot(dot3, 400);
+  }, []);
+
+  const animateOpacity = (dot) => ({
+    opacity: dot.interpolate({
+      inputRange: [0, 1],
+      outputRange: [0.3, 1],
+    }),
+    transform: [
+      {
+        translateY: dot.interpolate({
+          inputRange: [0, 1],
+          outputRange: [0, -3],
+        }),
+      },
+    ],
+  });
+
+  return (
+    <View style={styles.typingContainer}>
+      <Animated.View style={[styles.typingDot, animateOpacity(dot1)]} />
+      <Animated.View style={[styles.typingDot, animateOpacity(dot2)]} />
+      <Animated.View style={[styles.typingDot, animateOpacity(dot3)]} />
+    </View>
+  );
+};
 
 export default function ChatScreen({ route, navigation }) {
   const { contact: initialContact, chatKey } = route.params;
@@ -23,30 +77,66 @@ export default function ChatScreen({ route, navigation }) {
   const flatRef = useRef();
   const typingTimeoutRef = useRef(null);
   const otherUserTypingTimeoutRef = useRef(null);
-  const typingChannelRef = useRef(null); 
+  const typingChannelRef = useRef(null);
+  const isMountedRef = useRef(true);
 
-  const loadMessages = async () => {
+  const markMessagesAsRead = async () => {
     try {
-      setLoading(true);
+      const { error } = await supabase
+        .from('messages')
+        .update({ is_read: true })
+        .eq('chat_key', chatKey)
+        .eq('receiver_id', currentUser.uid)
+        .eq('is_read', false);
+
+      if (error) throw error;
+      console.log(' Messages marqués comme lus');
+    } catch (e) {
+      console.log(' Erreur markMessagesAsRead:', e);
+    }
+  };
+
+  const loadMessages = async (forceRefresh = false) => {
+    try {
+      if (!forceRefresh) {
+        setLoading(true);
+        
+        const cachedMessages = await CacheService.getCachedMessages(chatKey);
+        
+        if (cachedMessages) {
+          console.log(' Messages chargés depuis le cache');
+          setMessages(cachedMessages);
+          setLoading(false);
+          setTimeout(() => flatRef.current?.scrollToEnd?.({ animated: false }), 100);
+        }
+      }
+
       const { data, error } = await supabase
         .from('messages')
         .select('*')
         .eq('chat_key', chatKey)
         .order('created_at', { ascending: true });
+        
       if (error) throw error;
+
+      await CacheService.cacheMessages(chatKey, data || []);
       setMessages(data || []);
+      
+      await markMessagesAsRead();
+      
       setTimeout(() => flatRef.current?.scrollToEnd?.({ animated: true }), 200);
+      
     } catch (e) {
-      console.log('loadMessages', e);
+      console.log(' loadMessages error', e);
     } finally {
       setLoading(false);
     }
   };
 
   useEffect(() => {
+    isMountedRef.current = true;
     loadMessages();
 
-    
     const userStatusChannel = supabase
       .channel(`user_status_${contact.id}`)
       .on(
@@ -58,16 +148,15 @@ export default function ChatScreen({ route, navigation }) {
           filter: `id=eq.${contact.id}`
         },
         (payload) => {
-          
-          setContact(prev => ({...prev, ...payload.new}));
+          if (isMountedRef.current) {
+            setContact(prev => ({...prev, ...payload.new}));
+          }
         }
       )
-      .subscribe((status) => {
-        
-      });
+      .subscribe();
 
-   
-    const messagesChannel = supabase
+
+      const messagesChannel = supabase
       .channel(`messages_${chatKey}`)
       .on(
         'postgres_changes',
@@ -77,17 +166,17 @@ export default function ChatScreen({ route, navigation }) {
           table: 'messages',
           filter: `chat_key=eq.${chatKey}`
         },
-        (payload) => {
+        async (payload) => {
+          if (!isMountedRef.current) return;
+          
           const newMessage = payload.new;
+          console.log(' Nouveau message reçu:', newMessage);
           
           setMessages((prev) => {
-            const exists = prev.some(m => 
-              m.message === newMessage.message && 
-              m.sender_id === newMessage.sender_id &&
-              Math.abs(new Date(m.created_at) - new Date(newMessage.created_at)) < 5000
-            );
+            const exists = prev.some(m => m.id === newMessage.id);
             
             if (exists) {
+              console.log(' Message déjà existe, mise à jour');
               return prev.map(m => 
                 m.id?.toString().startsWith('temp_') && 
                 m.message === newMessage.message && 
@@ -95,27 +184,66 @@ export default function ChatScreen({ route, navigation }) {
                   ? newMessage 
                   : m
               );
+            } else {
+              console.log(' Nouveau message ajouté');
+              const updatedMessages = [...prev, newMessage];
+              CacheService.cacheMessages(chatKey, updatedMessages);
+              return updatedMessages;
             }
-            
-            return [...prev, newMessage];
           });
+          
+         
+          if (newMessage.receiver_id === currentUser.uid) {
+            await markMessagesAsRead();
+          }
           
           setTimeout(() => flatRef.current?.scrollToEnd({ animated: true }), 100);
         }
       )
-      .subscribe();
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'messages',
+          filter: `chat_key=eq.${chatKey}`
+        },
+        async (payload) => {
+          if (!isMountedRef.current) return;
+          
+          console.log(' Message mis à jour:', payload.new);
+          setMessages((prev) => {
+            const updatedMessages = prev.map(m => 
+              m.id === payload.new.id ? payload.new : m
+            );
+            CacheService.cacheMessages(chatKey, updatedMessages);
+            return updatedMessages;
+          });
+        }
+      )
+      .subscribe((status) => {
+        console.log(' Canal messages status:', status);
+      });
 
+    const typingRoomName = `typing:${chatKey}`;
+    console.log(' Création canal typing:', typingRoomName);
     
     const typingChannel = supabase
-      .channel(`typing_${chatKey}`, {
+      .channel(typingRoomName, {
         config: {
-          broadcast: { self: false } 
+          broadcast: { 
+            self: false,
+            ack: true 
+          }
         }
       })
       .on('broadcast', { event: 'typing' }, (payload) => {
+        if (!isMountedRef.current) return;
+        
+        console.log('⌨️ Typing reçu:', payload);
         
         if (payload.payload.userId !== currentUser.uid) {
-          
+          console.log(' Autre user est en train d\'écrire');
           setOtherUserTyping(true);
           
           if (otherUserTypingTimeoutRef.current) {
@@ -123,19 +251,26 @@ export default function ChatScreen({ route, navigation }) {
           }
           
           otherUserTypingTimeoutRef.current = setTimeout(() => {
-            
-            setOtherUserTyping(false);
+            if (isMountedRef.current) {
+              console.log('⏱ Timeout typing');
+              setOtherUserTyping(false);
+            }
           }, 3000);
         }
       })
       .subscribe((status) => {
-        
+        console.log(' Canal typing status:', status);
         if (status === 'SUBSCRIBED') {
           typingChannelRef.current = typingChannel;
+          console.log(' Canal typing prêt');
+        } else if (status === 'CHANNEL_ERROR') {
+          console.error(' Erreur canal typing');
         }
       });
 
     return () => {
+      console.log(' Nettoyage canaux');
+      isMountedRef.current = false;
       
       supabase.removeChannel(userStatusChannel);
       supabase.removeChannel(messagesChannel);
@@ -154,23 +289,36 @@ export default function ChatScreen({ route, navigation }) {
     setText(newText);
     resetUserActivity();
     
-   
-    if (newText.length > 0 && !isTyping && typingChannelRef.current) {
-      setIsTyping(true);
+    // Envoyer le signal à chaque frappe si on tape
+    if (newText.length > 0 && typingChannelRef.current) {
+      if (!isTyping) {
+        setIsTyping(true);
+        console.log(' Début typing');
+      }
       
-      await typingChannelRef.current.send({
-        type: 'broadcast',
-        event: 'typing',
-        payload: { userId: currentUser.uid, timestamp: Date.now() }
-      });
+      try {
+        await typingChannelRef.current.send({
+          type: 'broadcast',
+          event: 'typing',
+          payload: { 
+            userId: currentUser.uid,
+            userName: currentUser.displayName || 'User',
+            timestamp: Date.now() 
+          }
+        });
+      } catch (error) {
+        console.error(' Erreur envoi typing:', error);
+      }
     }
     
+    // Réinitialiser le timeout à chaque frappe
     if (typingTimeoutRef.current) {
       clearTimeout(typingTimeoutRef.current);
     }
     
     typingTimeoutRef.current = setTimeout(() => {
       setIsTyping(false);
+      console.log(' Arrêt typing');
     }, 2000);
   };
 
@@ -181,39 +329,76 @@ export default function ChatScreen({ route, navigation }) {
     
     const messageText = text.trim();
     setText('');
+    setIsTyping(false);
     
+    const tempId = `temp_${Date.now()}_${Math.random()}`;
     const optimisticMessage = {
-      id: `temp_${Date.now()}`,
+      id: tempId,
       chat_key: chatKey,
       sender_id: currentUser.uid,
       receiver_id: contact.id,
       message: messageText,
       image_url: null,
+      is_read: false,
       created_at: new Date().toISOString()
     };
     
-    setMessages(prev => [...prev, optimisticMessage]);
+    const updatedMessages = [...messages, optimisticMessage];
+    setMessages(updatedMessages);
+    await CacheService.cacheMessages(chatKey, updatedMessages);
+    
     setTimeout(() => flatRef.current?.scrollToEnd({ animated: true }), 100);
     
     try {
       setSending(true);
-      const { error } = await supabase.from('messages').insert([{
-        chat_key: chatKey,
-        sender_id: currentUser.uid,
-        receiver_id: contact.id,
-        message: messageText,
-        image_url: null
-      }]);
+      console.log(' Envoi message...');
+      
+      const { data, error } = await supabase
+        .from('messages')
+        .insert([{
+          chat_key: chatKey,
+          sender_id: currentUser.uid,
+          receiver_id: contact.id,
+          message: messageText,
+          image_url: null,
+          is_read: false
+        }])
+        .select()
+        .single();
       
       if (error) throw error;
+      
+      console.log(' Message envoyé:', data);
+      
+      // Remplacer le message optimiste par le vrai
+      setMessages(prev => {
+        const updated = prev.map(m => 
+          m.id === tempId ? data : m
+        );
+        CacheService.cacheMessages(chatKey, updated);
+        return updated;
+      });
 
+      // Notification push (si implémentée)
       if (contact.push_token) {
-        console.log('Notification désactivée:', messageText);
+        await sendPushNotification(
+          contact.push_token,
+          currentUser.displayName || 'Nouveau message',
+          messageText,
+          {
+            type: 'message',
+            chatKey: chatKey,
+            senderId: currentUser.uid
+          }
+        );
       }
+      
     } catch (e) {
-      console.log('sendText', e);
+      console.log(' sendText error', e);
       alert('Erreur envoi: ' + e.message);
-      setMessages(prev => prev.filter(m => m.id !== optimisticMessage.id));
+      const revertedMessages = messages.filter(m => m.id !== tempId);
+      setMessages(revertedMessages);
+      await CacheService.cacheMessages(chatKey, revertedMessages);
     } finally {
       setSending(false);
     }
@@ -239,7 +424,6 @@ export default function ChatScreen({ route, navigation }) {
     try {
       setSending(true);
       
-      
       const fileName = `${chatKey}_${currentUser.uid}_${Date.now()}.jpg`;
       const filePath = `chat/${fileName}`;
       
@@ -254,48 +438,57 @@ export default function ChatScreen({ route, navigation }) {
           upsert: true
         });
 
-      if (uploadError) {
-        console.log("Erreur upload:", uploadError);
-        throw uploadError;
-      }
+      if (uploadError) throw uploadError;
 
       const { data: urlData } = supabase.storage
         .from('chat')
         .getPublicUrl(filePath);
 
       const url = urlData.publicUrl;
-      console.log("Image URL:", url);
 
+      const tempId = `temp_${Date.now()}_${Math.random()}`;
       const optimisticMessage = {
-        id: `temp_${Date.now()}`,
+        id: tempId,
         chat_key: chatKey,
         sender_id: currentUser.uid,
         receiver_id: contact.id,
         message: null,
         image_url: url,
+        is_read: false,
         created_at: new Date().toISOString()
       };
       
-      setMessages(prev => [...prev, optimisticMessage]);
+      const updatedMessages = [...messages, optimisticMessage];
+      setMessages(updatedMessages);
+      await CacheService.cacheMessages(chatKey, updatedMessages);
+      
       setTimeout(() => flatRef.current?.scrollToEnd({ animated: true }), 100);
 
-      const { error } = await supabase.from('messages').insert([{
-        chat_key: chatKey,
-        sender_id: currentUser.uid,
-        receiver_id: contact.id,
-        message: null,
-        image_url: url
-      }]);
+      const { data, error } = await supabase
+        .from('messages')
+        .insert([{
+          chat_key: chatKey,
+          sender_id: currentUser.uid,
+          receiver_id: contact.id,
+          message: null,
+          image_url: url,
+          is_read: false
+        }])
+        .select()
+        .single();
 
-      if (error) {
-        console.log("Erreur insert message:", error);
-        setMessages(prev => prev.filter(m => m.id !== optimisticMessage.id));
-        throw error;
-      }
+      if (error) throw error;
+      
+      setMessages(prev => {
+        const updated = prev.map(m => 
+          m.id === tempId ? data : m
+        );
+        CacheService.cacheMessages(chatKey, updated);
+        return updated;
+      });
 
-    
     } catch (e) {
-      console.log('pickAndSendImage', e);
+      console.log(' pickAndSendImage error', e);
       alert('Erreur upload image: ' + e.message);
     } finally {
       setSending(false);
@@ -330,7 +523,7 @@ export default function ChatScreen({ route, navigation }) {
 
       alert(`Appel ${type} en cours...`);
     } catch (e) {
-      console.log('initiateCall error', e);
+      console.log(' initiateCall error', e);
       alert('Erreur appel');
     }
   };
@@ -384,10 +577,13 @@ export default function ChatScreen({ route, navigation }) {
           <Text style={styles.headerTitle}>{contact.name || contact.email}</Text>
           
           {otherUserTyping ? (
-            <Text style={styles.typingText}>✍️ en train d'écrire...</Text>
+            <View style={styles.typingWrapper}>
+              <Text style={styles.typingLabel}>en train d'écrire</Text>
+              <TypingIndicator />
+            </View>
           ) : (
             <Text style={styles.headerStatus}>
-              {contact.is_online ? 'En ligne' : 'Hors ligne'}
+              {contact.is_online ? ' En ligne' : ' Hors ligne'}
             </Text>
           )}
         </View>
@@ -408,18 +604,29 @@ export default function ChatScreen({ route, navigation }) {
       >
         <View style={styles.overlay} />
         
-        {loading ? (
+        {loading && !messages.length ? (
           <ActivityIndicator style={{ marginTop: 20 }} color="#25D366" />
         ) : (
-          <FlatList
-            ref={flatRef}
-            data={messages}
-            keyExtractor={(item) => item.id?.toString() || item.created_at}
-            renderItem={renderItem}
-            contentContainerStyle={{ padding: 12, paddingBottom: 80 }}
-            onContentSizeChange={() => flatRef.current?.scrollToEnd?.({ animated: true })}
-            onLayout={() => flatRef.current?.scrollToEnd?.({ animated: true })}
-          />
+          <>
+            <FlatList
+              ref={flatRef}
+              data={messages}
+              keyExtractor={(item) => item.id?.toString() || item.created_at}
+              renderItem={renderItem}
+              contentContainerStyle={{ padding: 12, paddingBottom: 80 }}
+              onContentSizeChange={() => flatRef.current?.scrollToEnd?.({ animated: true })}
+              onLayout={() => flatRef.current?.scrollToEnd?.({ animated: false })}
+            />
+            
+            {/* Indicateur de typing dans la zone des messages */}
+            {otherUserTyping && (
+              <View style={styles.typingBubbleContainer}>
+                <View style={styles.typingBubble}>
+                  <TypingIndicator />
+                </View>
+              </View>
+            )}
+          </>
         )}
       </ImageBackground>
 
@@ -471,11 +678,26 @@ const styles = StyleSheet.create({
   },
   headerTitle: { color: '#fff', fontWeight: '700', fontSize: 16 },
   headerStatus: { color: '#e8f5e9', fontSize: 12 },
-  typingText: { 
-    color: '#FFF', 
-    fontSize: 12, 
+  typingWrapper: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  typingLabel: {
+    color: '#FFF',
+    fontSize: 12,
     fontStyle: 'italic',
-    fontWeight: '500'
+  },
+  typingContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+  },
+  typingDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: '#FFF',
   },
   headerBtn: { padding: 8, marginLeft: 4 },
   container: { 
@@ -556,5 +778,24 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     justifyContent: 'center',
     alignItems: 'center',
-  }
+  },
+  typingBubbleContainer: {
+    position: 'absolute',
+    bottom: 20,
+    left: 12,
+    right: 0,
+    alignItems: 'flex-start',
+  },
+  typingBubble: {
+    backgroundColor: '#666866ff',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: 12,
+    borderBottomLeftRadius: 4,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.2,
+    shadowRadius: 1,
+    elevation: 2,
+  },
 });

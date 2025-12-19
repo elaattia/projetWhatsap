@@ -1,10 +1,11 @@
-// screens/HomeScreens/Forum.js
+// screens/HomeScreens/Forum.js (avec AsyncStorage)
 import React, { useEffect, useState, useRef } from 'react';
-import { View, Text, FlatList, TouchableOpacity, Image, StyleSheet, ActivityIndicator,TextInput,Modal,Alert,KeyboardAvoidingView,Platform,ScrollView} from 'react-native';
+import { View, Text, FlatList, TouchableOpacity, Image, StyleSheet, ActivityIndicator, TextInput, Modal, Alert, KeyboardAvoidingView, Platform, ScrollView, RefreshControl } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import { supabase } from '../../config/supabaseClient';
 import { auth } from '../../config/firebaseConfig';
 import { Ionicons } from '@expo/vector-icons';
+import CacheService from '../../services/cacheService';
 
 export default function Forum({ navigation }) {
   const [posts, setPosts] = useState([]);
@@ -21,8 +22,22 @@ export default function Forum({ navigation }) {
   const currentUser = auth.currentUser;
   const flatRef = useRef();
 
-  const loadPosts = async () => {
+  const loadPosts = async (forceRefresh = false) => {
     try {
+      if (!forceRefresh) {
+        setLoading(true);
+        
+        // 1. Charger depuis le cache d'abord
+        const cachedPosts = await CacheService.getCachedForumPosts();
+        
+        if (cachedPosts) {
+          console.log('Posts forum chargés depuis le cache');
+          setPosts(cachedPosts);
+          setLoading(false);
+        }
+      }
+
+      // 2. Charger depuis Supabase (en arrière-plan si cache disponible)
       const { data, error } = await supabase
         .from('forum_posts')
         .select(`
@@ -34,6 +49,7 @@ export default function Forum({ navigation }) {
 
       if (error) throw error;
 
+      // 3. Récupérer les likes de l'utilisateur
       const { data: userLikes, error: likesError } = await supabase
         .from('forum_likes')
         .select('post_id')
@@ -48,14 +64,24 @@ export default function Forum({ navigation }) {
         isLiked: likedPostIds.has(post.id)
       }));
 
+      // 4. Mettre à jour le cache et l'interface
+      await CacheService.cacheForumPosts(postsWithLikeStatus);
       setPosts(postsWithLikeStatus);
-    } catch (e) {
       
-      Alert.alert('Erreur', 'Impossible de charger les posts');
+    } catch (e) {
+      console.log('loadPosts error', e);
+      if (!posts.length) {
+        Alert.alert('Erreur', 'Impossible de charger les posts');
+      }
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
+  };
+
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    await loadPosts(true);
   };
 
   useEffect(() => {
@@ -67,7 +93,7 @@ export default function Forum({ navigation }) {
         'postgres_changes',
         { event: '*', schema: 'public', table: 'forum_posts' },
         () => {
-          loadPosts();
+          loadPosts(true);
         }
       )
       .subscribe();
@@ -78,7 +104,7 @@ export default function Forum({ navigation }) {
         'postgres_changes',
         { event: '*', schema: 'public', table: 'forum_likes' },
         () => {
-          loadPosts();
+          loadPosts(true);
         }
       )
       .subscribe();
@@ -135,8 +161,6 @@ export default function Forum({ navigation }) {
       let imageUrl = selectedImage;
 
       if (selectedImage && selectedImage.startsWith('file://')) {
-        
-        
         const uriParts = selectedImage.split('.');
         const fileExtension = uriParts[uriParts.length - 1].toLowerCase();
         
@@ -159,17 +183,13 @@ export default function Forum({ navigation }) {
             upsert: true
           });
 
-        if (uploadError) {
-          console.log('Upload error:', uploadError);
-          throw uploadError;
-        }
+        if (uploadError) throw uploadError;
 
         const { data: urlData } = supabase.storage
           .from('forum')
           .getPublicUrl(filePath);
 
         imageUrl = urlData.publicUrl;
-        console.log('Image uploaded:', imageUrl);
       }
 
       if (editingPost) {
@@ -183,10 +203,7 @@ export default function Forum({ navigation }) {
           .eq('id', editingPost.id)
           .eq('user_id', currentUser.uid);
 
-        if (error) {
-          console.log('Update error:', error);
-          throw error;
-        }
+        if (error) throw error;
         
         Alert.alert('Succès', 'Post modifié !');
       } else {
@@ -201,10 +218,7 @@ export default function Forum({ navigation }) {
             comments_count: 0
           }]);
 
-        if (error) {
-          console.log('Insert error:', error);
-          throw error;
-        }
+        if (error) throw error;
         
         Alert.alert('Succès', 'Post publié !');
       }
@@ -215,7 +229,8 @@ export default function Forum({ navigation }) {
       setSelectedImage(null);
       setEditingPost(null);
       
-      await loadPosts();
+      // Forcer le rechargement et mise à jour du cache
+      await loadPosts(true);
       
     } catch (e) {
       console.log('savePost error', e);
@@ -234,10 +249,7 @@ export default function Forum({ navigation }) {
           .eq('post_id', post.id)
           .eq('user_id', currentUser.uid);
 
-        if (deleteError) {
-          console.log('Unlike error:', deleteError);
-          throw deleteError;
-        }
+        if (deleteError) throw deleteError;
 
         const newCount = Math.max(0, (post.likes_count || 0) - 1);
         const { error: updateError } = await supabase
@@ -245,12 +257,7 @@ export default function Forum({ navigation }) {
           .update({ likes_count: newCount })
           .eq('id', post.id);
 
-        if (updateError) {
-          console.log('Update count error:', updateError);
-          throw updateError;
-        }
-
-        console.log('Unlike success, new count:', newCount);
+        if (updateError) throw updateError;
 
       } else {
         const { error: insertError } = await supabase
@@ -260,10 +267,7 @@ export default function Forum({ navigation }) {
             user_id: currentUser.uid
           }]);
 
-        if (insertError) {
-          console.log('Like error:', insertError);
-          throw insertError;
-        }
+        if (insertError) throw insertError;
 
         const newCount = (post.likes_count || 0) + 1;
         const { error: updateError } = await supabase
@@ -271,17 +275,14 @@ export default function Forum({ navigation }) {
           .update({ likes_count: newCount })
           .eq('id', post.id);
 
-        if (updateError) {
-          
-          throw updateError;
-        }
-
-        
+        if (updateError) throw updateError;
       }
 
-      await loadPosts();
+      // Recharger et mettre à jour le cache
+      await loadPosts(true);
       
     } catch (e) {
+      console.log('toggleLike error', e);
       Alert.alert('Erreur', 'Impossible de liker le post: ' + e.message);
     }
   };
@@ -302,61 +303,46 @@ export default function Forum({ navigation }) {
           style: 'destructive',
           onPress: async () => {
             try {
-              console.log('Deleting post:', post.id);
-              
-              const { error: likesError } = await supabase
+              // Supprimer les likes
+              await supabase
                 .from('forum_likes')
                 .delete()
                 .eq('post_id', post.id);
 
-              if (likesError) {
-                console.log('Delete likes error:', likesError);
-              }
-
-              const { error: commentsError } = await supabase
+              // Supprimer les commentaires
+              await supabase
                 .from('forum_comments')
                 .delete()
                 .eq('post_id', post.id);
 
-              if (commentsError) {
-                console.log('Delete comments error:', commentsError);
-              }
-
+              // Supprimer l'image si elle existe
               if (post.image_url && post.image_url.includes('forum/posts/')) {
                 try {
                   const urlParts = post.image_url.split('forum/posts/');
                   if (urlParts.length > 1) {
                     const imagePath = urlParts[1].split('?')[0];
-                    console.log('Deleting image:', imagePath);
-                    
-                    const { error: storageError } = await supabase.storage
+                    await supabase.storage
                       .from('forum')
                       .remove([`posts/${imagePath}`]);
-                    
-                    if (storageError) {
-                      console.log('Storage delete error:', storageError);
-                    }
                   }
                 } catch (storageErr) {
                   console.log('Error deleting image:', storageErr);
                 }
               }
 
+              // Supprimer le post
               const { error: postError } = await supabase
                 .from('forum_posts')
                 .delete()
                 .eq('id', post.id)
                 .eq('user_id', currentUser.uid);
 
-              if (postError) {
-                console.log('Delete post error:', postError);
-                throw postError;
-              }
+              if (postError) throw postError;
               
-              console.log('Post deleted successfully');
               Alert.alert('Succès', 'Post supprimé');
               
-              await loadPosts();
+              // Recharger et mettre à jour le cache
+              await loadPosts(true);
               
             } catch (e) {
               console.log('deletePost error', e);
@@ -451,7 +437,7 @@ export default function Forum({ navigation }) {
     );
   };
 
-  if (loading) {
+  if (loading && !posts.length) {
     return (
       <View style={styles.center}>
         <ActivityIndicator size="large" color="#25D366" />
@@ -463,22 +449,30 @@ export default function Forum({ navigation }) {
     <View style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Forum</Text>
-        <TouchableOpacity onPress={openCreateModal} style={styles.addBtn}>
-          <Ionicons name="add-circle" size={28} color="#fff" />
-        </TouchableOpacity>
+        <View style={styles.headerActions}>
+          <TouchableOpacity onPress={handleRefresh} style={styles.refreshBtn}>
+            <Ionicons name="refresh" size={24} color="#fff" />
+          </TouchableOpacity>
+          <TouchableOpacity onPress={openCreateModal} style={styles.addBtn}>
+            <Ionicons name="add-circle" size={28} color="#fff" />
+          </TouchableOpacity>
+        </View>
       </View>
 
       <FlatList
         ref={flatRef}
         data={posts}
-        keyExtractor={(item) => item.id}
+        keyExtractor={(item) => item.id.toString()}
         renderItem={renderPost}
         contentContainerStyle={styles.listContent}
-        refreshing={refreshing}
-        onRefresh={() => {
-          setRefreshing(true);
-          loadPosts();
-        }}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={handleRefresh}
+            colors={['#25D366']}
+            tintColor="#25D366"
+          />
+        }
         ListEmptyComponent={
           <View style={styles.emptyContainer}>
             <Ionicons name="document-text-outline" size={60} color="#ccc" />
@@ -486,6 +480,9 @@ export default function Forum({ navigation }) {
             <Text style={styles.emptySubtext}>
               Soyez le premier à publier !
             </Text>
+            <TouchableOpacity onPress={openCreateModal} style={styles.createFirstBtn}>
+              <Text style={styles.createFirstText}>Créer un post</Text>
+            </TouchableOpacity>
           </View>
         }
       />
@@ -580,7 +577,9 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
   },
-  headerTitle: { color: '#fff', fontSize: 22, fontWeight: 'bold' },
+  headerTitle: { color: '#fff', fontSize: 22, fontWeight: 'bold', flex: 1 },
+  headerActions: { flexDirection: 'row', gap: 12, alignItems: 'center' },
+  refreshBtn: { padding: 4 },
   addBtn: { padding: 4 },
   listContent: { padding: 12 },
   postCard: {
@@ -671,6 +670,18 @@ const styles = StyleSheet.create({
     color: '#bbb',
     marginTop: 8,
     textAlign: 'center',
+  },
+  createFirstBtn: {
+    marginTop: 20,
+    backgroundColor: '#25D366',
+    paddingHorizontal: 24,
+    paddingVertical: 12,
+    borderRadius: 8,
+  },
+  createFirstText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
   },
   modalContainer: { flex: 1, backgroundColor: '#fff' },
   modalHeader: {

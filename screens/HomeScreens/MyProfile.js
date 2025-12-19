@@ -1,4 +1,4 @@
-// screens/HomeScreens/MyProfile.js (VERSION SUPABASE STORAGE + DELETE ACCOUNT)
+// screens/HomeScreens/MyProfile.js 
 import React, { useEffect, useState } from "react";
 import { View, Text, StyleSheet, Image, TextInput, TouchableOpacity, ActivityIndicator, Alert, ScrollView, Modal } from "react-native";
 import * as ImagePicker from "expo-image-picker";
@@ -6,6 +6,7 @@ import { auth } from "../../config/firebaseConfig";
 import { supabase } from "../../config/supabaseClient";
 import { signOut, EmailAuthProvider, reauthenticateWithCredential, deleteUser } from "firebase/auth";
 import { Ionicons } from '@expo/vector-icons';
+import CacheService from '../../services/cacheService';
 
 export default function MyProfile() {
   const user = auth.currentUser;
@@ -21,12 +22,28 @@ export default function MyProfile() {
   const [phone, setPhone] = useState("");
   const [image, setImage] = useState(null);
 
-  // Modal suppression
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [passwordForDelete, setPasswordForDelete] = useState("");
 
   const loadProfile = async () => {
     try {
+      setLoading(true);
+
+
+      const cachedProfile = await CacheService.getCachedUserProfile(user.uid);
+      
+      if (cachedProfile) {
+        console.log(' Profil chargé depuis le cache');
+        setProfile(cachedProfile);
+        setName(cachedProfile.name || "");
+        setPseudo(cachedProfile.pseudo || "");
+        setPhone(cachedProfile.phone || "");
+        setImage(cachedProfile.avatar || null);
+        setLoading(false);
+      }
+
+
+
       const { data, error } = await supabase
         .from("users")
         .select("*")
@@ -35,16 +52,21 @@ export default function MyProfile() {
 
       if (error) {
         console.log("Erreur load profile:", error);
+        if (!cachedProfile) {
+          setLoading(false);
+        }
       } else {
+        await CacheService.cacheUserProfile(user.uid, data);
+        
         setProfile(data);
         setName(data.name || "");
         setPseudo(data.pseudo || "");
         setPhone(data.phone || "");
         setImage(data.avatar || null);
+        setLoading(false);
       }
     } catch (e) {
       console.log("Exception load profile:", e);
-    } finally {
       setLoading(false);
     }
   };
@@ -76,8 +98,6 @@ export default function MyProfile() {
     setUploadingImage(true);
     
     try {
-      console.log("Début upload Supabase...");
-      
       const uriParts = uri.split('.');
       const fileExtension = uriParts[uriParts.length - 1].toLowerCase();
       
@@ -90,11 +110,7 @@ export default function MyProfile() {
       const fileName = `${user.uid}_${Date.now()}.${fileExtension}`;
       const filePath = `avatars/${fileName}`;
       
-      console.log(`Upload fichier: ${fileName} (${mimeType})`);
-      
-      console.log("Création FormData...");
       const formData = new FormData();
-      
       const uriPathParts = uri.split('/');
       const fileNameFromUri = uriPathParts[uriPathParts.length - 1];
       
@@ -104,40 +120,33 @@ export default function MyProfile() {
         type: mimeType
       });
       
-      console.log("Upload vers Supabase Storage...");
-      const { data, error: uploadError } = await supabase.storage
+      const { error: uploadError } = await supabase.storage
         .from('avatars')
         .upload(filePath, formData, {
           contentType: mimeType,
           upsert: true
         });
 
-      if (uploadError) {
-        console.log("Erreur upload:", uploadError);
-        throw uploadError;
-      }
+      if (uploadError) throw uploadError;
 
-      console.log("Récupération URL publique...");
       const { data: urlData } = supabase.storage
         .from('avatars')
         .getPublicUrl(filePath);
 
       const publicURL = urlData.publicUrl;
-      console.log("URL obtenue:", publicURL);
-      
       setImage(publicURL);
 
-      console.log("Mise à jour DB...");
       const { error: updateError } = await supabase
         .from("users")
         .update({ avatar: publicURL })
         .eq("id", user.uid);
 
       if (updateError) {
-        console.log("Erreur update avatar:", updateError);
         Alert.alert("Erreur", "Impossible de mettre à jour l'avatar");
       } else {
-        console.log("Succès !");
+        // Mettre à jour le cache
+        const updatedProfile = { ...profile, avatar: publicURL };
+        await CacheService.cacheUserProfile(user.uid, updatedProfile);
         Alert.alert("Succès", "Photo mise à jour !");
       }
     } catch (e) {
@@ -167,13 +176,21 @@ export default function MyProfile() {
         .eq("id", user.uid);
 
       if (error) {
-        console.log("Erreur save profile:", error);
         Alert.alert("Erreur", error.message);
       } else {
+        // Mettre à jour le cache
+        const updatedProfile = {
+          ...profile,
+          name: name.trim(),
+          pseudo: pseudo.trim(),
+          phone: phone.trim(),
+        };
+        await CacheService.cacheUserProfile(user.uid, updatedProfile);
+        setProfile(updatedProfile);
+        
         Alert.alert("Succès", "Profil mis à jour !");
       }
     } catch (e) {
-      console.log("Exception save profile:", e);
       Alert.alert("Erreur", "Une erreur est survenue");
     } finally {
       setUpdating(false);
@@ -191,9 +208,10 @@ export default function MyProfile() {
           style: "destructive",
           onPress: async () => {
             try {
+              // Nettoyer le cache
+              await CacheService.clearAllCache();
               await signOut(auth);
             } catch (e) {
-              console.log("Erreur logout:", e);
               Alert.alert("Erreur", "Impossible de se déconnecter");
             }
           }
@@ -215,24 +233,20 @@ export default function MyProfile() {
     setDeleting(true);
 
     try {
-      // 1. Réauthentification
       const credential = EmailAuthProvider.credential(user.email, passwordForDelete);
       await reauthenticateWithCredential(user, credential);
 
-      // 2. Supprimer les données Supabase
       const { error: supabaseError } = await supabase
         .from("users")
         .delete()
         .eq("id", user.uid);
 
       if (supabaseError) {
-        console.log("Erreur suppression Supabase:", supabaseError);
         Alert.alert("Erreur", "Impossible de supprimer les données");
         setDeleting(false);
         return;
       }
 
-      // 3. Supprimer l'avatar du storage (optionnel)
       if (image) {
         try {
           const fileName = image.split('/').pop();
@@ -242,7 +256,9 @@ export default function MyProfile() {
         }
       }
 
-      // 4. Supprimer le compte Firebase
+      // Nettoyer tout le cache
+      await CacheService.clearAllCache();
+      
       await deleteUser(user);
 
       Alert.alert("Compte supprimé", "Votre compte a été supprimé avec succès");
@@ -250,8 +266,6 @@ export default function MyProfile() {
       setPasswordForDelete("");
       
     } catch (e) {
-      console.log("Erreur suppression compte:", e);
-      
       if (e.code === "auth/wrong-password" || e.code === "auth/invalid-credential") {
         Alert.alert("Erreur", "Mot de passe incorrect");
       } else if (e.code === "auth/requires-recent-login") {
@@ -281,7 +295,6 @@ export default function MyProfile() {
         </TouchableOpacity>
       </View>
 
-      {/* Photo */}
       <TouchableOpacity onPress={pickImage} disabled={uploadingImage}>
         <View style={styles.avatarContainer}>
           {image ? (
@@ -346,7 +359,6 @@ export default function MyProfile() {
         </TouchableOpacity>
       </View>
 
-      {/* Section Déconnexion et Suppression */}
       <View style={styles.actionSection}>
         <TouchableOpacity 
           style={styles.logoutButton}
@@ -365,7 +377,7 @@ export default function MyProfile() {
         </TouchableOpacity>
       </View>
 
-      {/* Modal de confirmation de suppression */}
+      {/* Modal de suppression - identique à l'original */}
       <Modal
         visible={showDeleteModal}
         transparent={true}
@@ -426,16 +438,10 @@ export default function MyProfile() {
   );
 }
 
+// Styles identiques à l'original
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: "#f5f5f5",
-  },
-  center: { 
-    flex: 1, 
-    justifyContent: "center", 
-    alignItems: "center" 
-  },
+  container: { flex: 1, backgroundColor: "#f5f5f5" },
+  center: { flex: 1, justifyContent: "center", alignItems: "center" },
   header: {
     backgroundColor: "#25D366",
     paddingTop: 50,
@@ -445,27 +451,10 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     alignItems: "center",
   },
-  headerTitle: {
-    color: "#fff",
-    fontSize: 22,
-    fontWeight: "bold",
-  },
-  logoutBtn: {
-    padding: 8,
-  },
-  avatarContainer: {
-    alignSelf: "center",
-    marginTop: 30,
-    marginBottom: 10,
-    position: "relative",
-  },
-  avatar: {
-    width: 120,
-    height: 120,
-    borderRadius: 60,
-    borderWidth: 3,
-    borderColor: "#25D366",
-  },
+  headerTitle: { color: "#fff", fontSize: 22, fontWeight: "bold" },
+  logoutBtn: { padding: 8 },
+  avatarContainer: { alignSelf: "center", marginTop: 30, marginBottom: 10, position: "relative" },
+  avatar: { width: 120, height: 120, borderRadius: 60, borderWidth: 3, borderColor: "#25D366" },
   uploadingOverlay: {
     position: "absolute",
     top: 0,
@@ -477,13 +466,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
-  changePhoto: {
-    textAlign: "center",
-    marginTop: 8,
-    color: "#25D366",
-    fontWeight: "bold",
-    fontSize: 16,
-  },
+  changePhoto: { textAlign: "center", marginTop: 8, color: "#25D366", fontWeight: "bold", fontSize: 16 },
   card: {
     margin: 20,
     backgroundColor: "#fff",
@@ -495,13 +478,7 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.1,
     shadowRadius: 4,
   },
-  label: {
-    color: "#444",
-    marginTop: 15,
-    marginBottom: 6,
-    fontWeight: "600",
-    fontSize: 14,
-  },
+  label: { color: "#444", marginTop: 15, marginBottom: 6, fontWeight: "600", fontSize: 14 },
   input: {
     backgroundColor: "#f5f5f5",
     padding: 12,
@@ -517,33 +494,13 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#e0e0e0",
   },
-  disabledText: {
-    color: "#999",
-    fontSize: 16,
-  },
-  btn: {
-    backgroundColor: "#25D366",
-    padding: 14,
-    borderRadius: 10,
-    marginTop: 25,
-  },
-  btnDisabled: {
-    backgroundColor: "#999",
-  },
-  btnText: {
-    textAlign: "center",
-    color: "#fff",
-    fontSize: 18,
-    fontWeight: "bold",
-  },
-  // Section Actions
-  actionSection: {
-    marginHorizontal: 20,
-    marginTop: 10,
-    gap: 12,
-  },
+  disabledText: { color: "#999", fontSize: 16 },
+  btn: { backgroundColor: "#25D366", padding: 14, borderRadius: 10, marginTop: 25 },
+  btnDisabled: { backgroundColor: "#999" },
+  btnText: { textAlign: "center", color: "#fff", fontSize: 18, fontWeight: "bold" },
+  actionSection: { marginHorizontal: 20, marginTop: 10, gap: 12 },
   logoutButton: {
-    backgroundColor: "#FF9500",
+    backgroundColor: "#396b00ff",
     padding: 16,
     borderRadius: 12,
     flexDirection: "row",
@@ -555,16 +512,10 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.1,
     shadowRadius: 4,
   },
-  btnIcon: {
-    marginRight: 8,
-  },
-  logoutButtonText: {
-    color: "#fff",
-    fontSize: 16,
-    fontWeight: "bold",
-  },
+  btnIcon: { marginRight: 8 },
+  logoutButtonText: { color: "#fff", fontSize: 16, fontWeight: "bold" },
   deleteButton: {
-    backgroundColor: "#dc3545",
+    backgroundColor: "#760f19ff",
     padding: 16,
     borderRadius: 12,
     flexDirection: "row",
@@ -576,12 +527,7 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.1,
     shadowRadius: 4,
   },
-  deleteButtonText: {
-    color: "#fff",
-    fontSize: 16,
-    fontWeight: "bold",
-  },
-  // Modal styles
+  deleteButtonText: { color: "#fff", fontSize: 16, fontWeight: "bold" },
   modalOverlay: {
     flex: 1,
     backgroundColor: "rgba(0,0,0,0.5)",
@@ -595,16 +541,8 @@ const styles = StyleSheet.create({
     width: "85%",
     maxWidth: 400,
   },
-  modalHeader: {
-    alignItems: "center",
-    marginBottom: 15,
-  },
-  modalTitle: {
-    fontSize: 22,
-    fontWeight: "bold",
-    color: "#333",
-    marginTop: 10,
-  },
+  modalHeader: { alignItems: "center", marginBottom: 15 },
+  modalTitle: { fontSize: 22, fontWeight: "bold", color: "#333", marginTop: 10 },
   modalText: {
     fontSize: 15,
     color: "#666",
@@ -612,12 +550,7 @@ const styles = StyleSheet.create({
     marginBottom: 20,
     lineHeight: 22,
   },
-  modalLabel: {
-    fontSize: 14,
-    fontWeight: "600",
-    color: "#444",
-    marginBottom: 8,
-  },
+  modalLabel: { fontSize: 14, fontWeight: "600", color: "#444", marginBottom: 8 },
   modalInput: {
     backgroundColor: "#f5f5f5",
     padding: 14,
@@ -627,30 +560,10 @@ const styles = StyleSheet.create({
     borderColor: "#e0e0e0",
     marginBottom: 20,
   },
-  modalButtons: {
-    flexDirection: "row",
-    gap: 10,
-  },
-  modalBtn: {
-    flex: 1,
-    padding: 14,
-    borderRadius: 10,
-    alignItems: "center",
-  },
-  modalBtnCancel: {
-    backgroundColor: "#f0f0f0",
-  },
-  modalBtnCancelText: {
-    color: "#333",
-    fontSize: 16,
-    fontWeight: "600",
-  },
-  modalBtnDelete: {
-    backgroundColor: "#dc3545",
-  },
-  modalBtnDeleteText: {
-    color: "#fff",
-    fontSize: 16,
-    fontWeight: "bold",
-  },
+  modalButtons: { flexDirection: "row", gap: 10 },
+  modalBtn: { flex: 1, padding: 14, borderRadius: 10, alignItems: "center" },
+  modalBtnCancel: { backgroundColor: "#f0f0f0" },
+  modalBtnCancelText: { color: "#333", fontSize: 16, fontWeight: "600" },
+  modalBtnDelete: { backgroundColor: "#dc3545" },
+  modalBtnDeleteText: { color: "#fff", fontSize: 16, fontWeight: "bold" },
 });
